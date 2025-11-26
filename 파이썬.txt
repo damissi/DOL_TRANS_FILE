@@ -1,0 +1,147 @@
+import os
+import json
+import sqlite3
+import hashlib
+import asyncio
+from typing import List, Dict, Any
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from google import genai
+from google.genai import types
+
+# ==========================================
+# [설정] API 키를 여기에 입력하거나 환경변수로 설정하세요.
+# ==========================================
+API_KEY = "" 
+
+app = FastAPI()
+
+# CORS 허용 (브라우저 접속 차단 방지)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# SQLite 캐시 DB 초기화
+conn = sqlite3.connect("translation_cache.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS cache (
+        hash_key TEXT PRIMARY KEY,
+        original_text TEXT,
+        translated_text TEXT
+    )
+""")
+conn.commit()
+
+# Gemini 클라이언트 설정
+client = genai.Client(api_key=API_KEY)
+
+# 단어장 로드
+try:
+    with open("glossary.json", "r", encoding="utf-8") as f:
+        GLOSSARY = json.load(f)
+        print(f"[INIT] 단어장 로드 완료: {len(GLOSSARY)}개 항목")
+except FileNotFoundError:
+    GLOSSARY = {}
+    print("[WARN] glossary.json 파일을 찾을 수 없습니다.")
+
+class TranslateRequest(BaseModel):
+    texts: List[str] # HTML 태그가 포함된 토큰화된 문자열 리스트
+
+def get_hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+@app.post("/translate")
+async def translate_text(request: TranslateRequest):
+    results = []
+    texts_to_translate = []
+    indices_to_translate = []
+
+    print(f"\n[REQ] 요청 수신: {len(request.texts)}개 문단")
+
+    # 1. 캐시 확인
+    for idx, text in enumerate(request.texts):
+        if not text.strip():
+            results.append(text)
+            continue
+            
+        h_key = get_hash(text)
+        cursor.execute("SELECT translated_text FROM cache WHERE hash_key=?", (h_key,))
+        row = cursor.fetchone()
+        
+        if row:
+            # print(f"[HIT] 캐시 발견: {text[:20]}...")
+            results.append(row[0])
+        else:
+            print(f"[MISS] API 호출 필요: {text[:30]}...")
+            results.append(None) # 나중에 채움
+            texts_to_translate.append(text)
+            indices_to_translate.append(idx)
+
+    # 2. Gemini API 호출 (번역 필요한 게 있을 때만)
+    if texts_to_translate:
+        glossary_text = ", ".join([f"{k}->{v}" for k, v in GLOSSARY.items()])
+        
+        system_instruction = f"""
+        Role: Translator for the game 'Degree of Lewdity'.
+        Output: JSON Array of strings.
+        Glossary: {glossary_text}
+        
+        Rules:
+        1. Input contains <t_ID> tags. PRESERVE IDs.
+        2. Translate text inside tags: <t0>Run</t0> -> <t0>달리기</t0>.
+        3. Translate surrounding text.
+        4. Reorder tags for Korean grammar (SOV).
+        5. DO NOT translate variables ($money) or numbers.
+        6. If input is just a tag <t0/> with no text, return it as is.
+        """
+
+        try:
+            # JSON 형태로 강제 응답 요청
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=json.dumps(texts_to_translate),
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json"
+                )
+            )
+            
+            translated_batch = json.loads(response.text)
+            
+            # 결과 저장 및 병합
+            if len(translated_batch) != len(texts_to_translate):
+                print(f"[ERR] 개수 불일치! 요청:{len(texts_to_translate)} vs 응답:{len(translated_batch)}")
+                # 비상 시 원문 반환
+                for i, idx in enumerate(indices_to_translate):
+                    results[idx] = texts_to_translate[i]
+            else:
+                for i, translated in enumerate(translated_batch):
+                    original = texts_to_translate[i]
+                    idx = indices_to_translate[i]
+                    
+                    results[idx] = translated
+                    
+                    # DB 저장
+                    cursor.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?)", 
+                                   (get_hash(original), original, translated))
+                conn.commit()
+                print(f"[API] {len(texts_to_translate)}개 항목 번역 완료 및 저장.")
+
+        except Exception as e:
+            print(f"[CRITICAL ERROR] Gemini 호출 중 오류: {str(e)}")
+            # 에러 발생 시 원문 그대로 반환 (게임 멈춤 방지)
+            for i, idx in enumerate(indices_to_translate):
+                results[idx] = f"[ERR] {texts_to_translate[i]}"
+
+    return {"translations": results}
+
+if __name__ == "__main__":
+    import uvicorn
+    print("=== DoL Debug Translation Server Started ===")
+    print("Running on http://127.0.0.1:8000")
+    uvicorn.run(app, host="127.0.0.1", port=8000)
