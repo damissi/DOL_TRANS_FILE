@@ -1,0 +1,363 @@
+// ==UserScript==
+// @name         DoL Debug Translator (v2.5 Token Recovery)
+// @namespace    http://tampermonkey.net/
+// @version      2.5-TOKEN-RECOVERY
+// @description  Degree of Lewdity 번역기 (사라진 슬라이더/버튼 복구 기능 탑재)
+// @author       You
+// @match        http://localhost:*/*
+// @match        https://vrelnir.blogspot.com/*
+// @match        https://*.itch.io/*
+// @match        file:///*
+// @connect      localhost
+// @connect      127.0.0.1
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const API_URL = "http://127.0.0.1:8000/translate";
+
+    // ==========================================
+    // [UI] 디버그 패널
+    // ==========================================
+    const debugPanel = document.createElement('div');
+    debugPanel.id = 'dol-debug-panel';
+    debugPanel.style.cssText = `
+        position: fixed; bottom: 10px; right: 10px; width: 300px; height: 200px;
+        background: rgba(0,0,0,0.8); color: lime; font-family: monospace; font-size: 11px;
+        z-index: 99999; padding: 10px; overflow-y: auto; border: 1px solid lime;
+        pointer-events: none;
+    `;
+    document.body.appendChild(debugPanel);
+
+    function log(msg, type='INFO') {
+        const time = new Date().toLocaleTimeString();
+        const color = type === 'ERR' ? 'red' : (type === 'WARN' ? 'yellow' : 'lime');
+        debugPanel.innerHTML = `<div style="color:${color}">[${time}] ${msg}</div>` + debugPanel.innerHTML;
+        console.log(`[DoL-Trans][${type}]`, msg);
+    }
+
+    log("v2.5 로드됨. '토큰 회수(Token Recovery)' 모드.", "INFO");
+
+    // ==========================================
+    // [Core] Helpers
+    // ==========================================
+    let elementCache = {};
+    let cacheIndex = 0;
+
+    function resetCache() {
+        elementCache = {};
+        cacheIndex = 0;
+    }
+
+    function hasHangul(text) {
+        return /[ㄱ-ㅎ|ㅏ-ㅣ|가-힣]/.test(text);
+    }
+
+    function hasEnglish(text) {
+        const cleanText = text.replace(/<[^>]*>/g, '');
+        return /[a-zA-Z]/.test(cleanText);
+    }
+
+    // [핵심 변경] MOUSE, METER 등 커스텀 태그 추가
+    function isInline(node) {
+        if (node.nodeType === Node.TEXT_NODE) return true;
+        if (node.nodeType === Node.ELEMENT_NODE) {
+            const tag = node.tagName;
+            return ['SPAN', 'A', 'B', 'I', 'STRONG', 'EM', 'SMALL', 'FONT', 'S', 'U',
+                    'SUB', 'SUP', 'BIG', 'CODE', 'LABEL', 'BUTTON', 'INPUT', 'IMG',
+                    'SELECT', 'TEXTAREA', 'Q', 'ABBR', 'CITE', 'VAR', 'KBD',
+                    'MOUSE', 'METER', 'PROGRESS'].includes(tag) ||
+                   node.classList.contains('macro-link');
+        }
+        return false;
+    }
+
+    // ==========================================
+    // [Core] Serializer
+    // ==========================================
+    function serializeNode(node) {
+        if (node.nodeType === Node.TEXT_NODE) {
+            return node.textContent;
+        }
+
+        if (node.nodeType === Node.ELEMENT_NODE) {
+            if (['SCRIPT', 'STYLE', 'NOSCRIPT'].includes(node.tagName)) return '';
+
+            // 인라인이 아니어도 LABEL이나 MOUSE는 통과
+            if (!isInline(node) && !['LABEL', 'MOUSE'].includes(node.tagName)) return '';
+
+            const id = cacheIndex++;
+            elementCache[id] = node;
+
+            // 단일 태그 처리 (RANGE 슬라이더 포함)
+            if (['INPUT', 'IMG', 'BR', 'HR', 'WBR'].includes(node.tagName)) {
+                return `<t${id}/>`;
+            }
+
+            let innerText = "";
+            node.childNodes.forEach(child => {
+                innerText += serializeNode(child);
+            });
+
+            return `<t${id}>${innerText}</t${id}>`;
+        }
+        return '';
+    }
+
+    // ==========================================
+    // [Core] Reconstructor (with Recovery)
+    // ==========================================
+    function reconstructDOM(translatedText, usedSet) {
+        const rootFragment = document.createDocumentFragment();
+        const stack = [rootFragment];
+
+        // [토큰 회수] 원본 텍스트에 있었던 모든 토큰 ID 추출
+        // 예: translatedText가 "<t0>안녕</t0>"이라면 0번 토큰이 사용된 것임.
+        // 하지만 serialize할 때 생성된 ID들 중, translatedText에 없는 것이 있다면? -> 누락된 것!
+
+        // 여기서는 단순히 파싱만 하고, 누락된 건 상위 함수에서 처리하거나
+        // 혹은 여기서 파싱하면서 발견된 ID를 usedSet에 넣음.
+
+        const tokens = translatedText.split(/(<\/?t\d+\/?>)/g);
+
+        tokens.forEach(token => {
+            if (/^<\/t\d+>$/.test(token)) {
+                if (stack.length > 1) stack.pop();
+            }
+            else if (/^<t(\d+)\/>$/.test(token)) {
+                const id = token.match(/^<t(\d+)\/>$/)[1];
+                const el = elementCache[id];
+                if (el) {
+                    usedSet.add(el);
+                    el.classList.add('dol-translated');
+                    stack[stack.length - 1].appendChild(el);
+                }
+            }
+            else if (/^<t(\d+)>$/.test(token)) {
+                const id = token.match(/^<t(\d+)>$/)[1];
+                const el = elementCache[id];
+                if (el) {
+                    usedSet.add(el);
+                    el.classList.add('dol-translated');
+                    el.textContent = '';
+                    stack[stack.length - 1].appendChild(el);
+                    stack.push(el);
+                }
+            }
+            else if (token) {
+                stack[stack.length - 1].appendChild(document.createTextNode(token));
+            }
+        });
+
+        return rootFragment;
+    }
+
+    // ==========================================
+    // [Logic] Process Translation
+    // ==========================================
+    function processTranslation() {
+        const container = document.querySelector('#passages');
+        if (!container || container.getAttribute('data-processing')) return;
+
+        observer.disconnect();
+        container.setAttribute('data-processing', 'true');
+
+        try {
+            resetCache();
+            const textChunks = [];
+            const markerIds = [];
+            const originalGroups = [];
+            const groupTokenIds = []; // 각 그룹에 포함된 토큰 ID들 저장
+
+            function scanNodes(parentNode) {
+                let currentClusterText = "";
+                let currentClusterNodes = [];
+                let currentTokenIds = [];
+
+                const flushCluster = () => {
+                    const hasContent = currentClusterText.trim().length > 0 || currentClusterNodes.some(n => n.nodeType === Node.ELEMENT_NODE);
+
+                    // LABEL이나 MOUSE 태그가 포함되어 있다면 무조건 번역
+                    const hasSpecialTag = currentClusterNodes.some(n => ['LABEL', 'MOUSE'].includes(n.nodeName));
+
+                    if (hasContent && (hasEnglish(currentClusterText) || hasSpecialTag)) {
+                        const firstNode = currentClusterNodes[0];
+                        const parent = firstNode.parentNode;
+
+                        if (parent) {
+                            const marker = document.createElement('span');
+                            const markerId = `dol-marker-${Date.now()}-${textChunks.length}`;
+                            marker.id = markerId;
+                            marker.style.display = 'none';
+
+                            parent.insertBefore(marker, firstNode);
+
+                            textChunks.push(currentClusterText);
+                            markerIds.push(markerId);
+                            originalGroups.push([...currentClusterNodes]);
+                            groupTokenIds.push([...currentTokenIds]); // 토큰 ID 목록 저장
+                        }
+                    }
+                    currentClusterText = "";
+                    currentClusterNodes = [];
+                    currentTokenIds = [];
+                };
+
+                Array.from(parentNode.childNodes).forEach(node => {
+                    // LABEL, MOUSE는 독립 클러스터로 처리
+                    if (['LABEL', 'MOUSE'].includes(node.nodeName)) {
+                        flushCluster();
+
+                        // 임시로 캐시 인덱스 저장 (serializeNode가 증가시키므로)
+                        const startIndex = cacheIndex;
+                        const serialized = serializeNode(node);
+
+                        if (serialized) {
+                            currentClusterText = serialized;
+                            currentClusterNodes = [node];
+                            // 이 노드 내부에서 생성된 모든 ID 수집
+                            for (let i = startIndex; i < cacheIndex; i++) currentTokenIds.push(i);
+                            flushCluster();
+                        }
+                        return;
+                    }
+
+                    if (isInline(node)) {
+                        const startIndex = cacheIndex;
+                        const serialized = serializeNode(node);
+                        if (serialized || node.nodeType === Node.TEXT_NODE) {
+                            currentClusterText += serialized || node.textContent;
+                            currentClusterNodes.push(node);
+                            for (let i = startIndex; i < cacheIndex; i++) currentTokenIds.push(i);
+                        }
+                    } else {
+                        flushCluster();
+                        if (!['SCRIPT', 'STYLE', 'TEXTAREA'].includes(node.tagName)) {
+                            scanNodes(node);
+                        }
+                    }
+                });
+                flushCluster();
+            }
+
+            scanNodes(container);
+
+            if (textChunks.length === 0) {
+                 restartObserver();
+                 return;
+            }
+
+            log(`서버 전송: ${textChunks.length}개 클러스터`);
+
+            GM_xmlhttpRequest({
+                method: "POST",
+                url: API_URL,
+                headers: { "Content-Type": "application/json" },
+                data: JSON.stringify({ texts: textChunks }),
+                onload: function(response) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        const translations = data.translations;
+
+                        translations.forEach((transText, index) => {
+                            if (!transText || transText.startsWith('[ERR]')) return;
+
+                            const markerId = markerIds[index];
+                            const marker = document.getElementById(markerId);
+                            if (!marker) return;
+
+                            const parent = marker.parentNode;
+                            if (!parent) return;
+
+                            const usedElements = new Set();
+                            const newFragment = reconstructDOM(transText, usedElements);
+
+                            // [토큰 구조대] 누락된 중요 요소(INPUT 등) 구출 작전
+                            const allIds = groupTokenIds[index];
+                            allIds.forEach(id => {
+                                const originalEl = elementCache[id];
+                                if (originalEl && !usedElements.has(originalEl)) {
+                                    // 번역 결과에 포함되지 않았는데, 중요한 태그라면?
+                                    if (['INPUT', 'SELECT', 'BUTTON', 'IMG'].includes(originalEl.tagName)) {
+                                        // log(`[구조대] 누락된 태그 복구: ${originalEl.tagName}`, 'WARN');
+                                        originalEl.classList.add('dol-translated');
+                                        newFragment.appendChild(originalEl); // 맨 뒤에 붙여넣기
+                                        usedElements.add(originalEl); // 살려냈으니 목록에 추가
+                                    }
+                                }
+                            });
+
+                            // 최상위 텍스트 래핑
+                            Array.from(newFragment.childNodes).forEach(child => {
+                                if (child.nodeType === Node.TEXT_NODE && child.textContent.trim()) {
+                                    const wrapper = document.createElement('span');
+                                    wrapper.className = 'dol-translated';
+                                    wrapper.textContent = child.textContent;
+                                    newFragment.replaceChild(wrapper, child);
+                                }
+                            });
+
+                            parent.insertBefore(newFragment, marker);
+
+                            // 청소
+                            const originals = originalGroups[index];
+                            originals.forEach(node => {
+                                if (node.parentNode === parent && !usedElements.has(node)) {
+                                    parent.removeChild(node);
+                                }
+                            });
+
+                            marker.remove();
+                        });
+                        log("업데이트 완료.", "INFO");
+
+                    } catch (e) {
+                        log(`응답 처리 오류: ${e.message}`, 'ERR');
+                    } finally {
+                        restartObserver();
+                    }
+                },
+                onerror: function() {
+                    log("서버 통신 실패.", 'ERR');
+                    restartObserver();
+                }
+            });
+
+        } catch (e) {
+            log(`로직 오류: ${e.message}`, 'ERR');
+            restartObserver();
+        }
+    }
+
+    function restartObserver() {
+        const container = document.querySelector('#passages');
+        if(container) container.removeAttribute('data-processing');
+        observer.observe(document.getElementById('passages') || document.body, {
+            childList: true, subtree: true, characterData: true
+        });
+    }
+
+    let debounceTimer;
+    const observer = new MutationObserver((mutations) => {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+            if (!document.querySelector('#passages[data-processing]')) {
+                processTranslation();
+            }
+        }, 300);
+    });
+
+    const checkExist = setInterval(function() {
+        const container = document.getElementById('passages');
+        if (container && container.innerText.trim().length > 0) {
+            clearInterval(checkExist);
+            log("게임 감지됨! (즉시 실행)", "INFO");
+            processTranslation();
+            restartObserver();
+        }
+    }, 1000);
+
+})();
